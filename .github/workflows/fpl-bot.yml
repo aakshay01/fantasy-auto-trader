@@ -1,0 +1,32 @@
+name: FPL Transfer Bot
+
+on:
+  workflow_dispatch:      # manual button to test any time
+  schedule:
+    # 19:30 IST every Friday  →  14:00 UTC
+    - cron:  '30 14 * * 5'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          FPL_EMAIL:        ${{ secrets.FPL_EMAIL }}
+          FPL_PASSWORD:     ${{ secrets.FPL_PASSWORD }}
+          FPL_TEAM_ID:      ${{ secrets.FPL_TEAM_ID }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
