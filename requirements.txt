@@ -11,10 +11,12 @@ jdcal==1.4.1
 numpy==1.19.2
 openpyxl==3.0.5
 pandas==1.1.2
-PuLP==2.3
+PuLP==2.7.0
 pyparsing==2.4.7
 python-dateutil==2.8.1
-pytz==2020.1
+pytz==2024.1
+python-fpl==0.7.5
+python-telegram-bot==20.6
 requests==2.24.0
 six==1.15.0
 urllib3==1.25.10
