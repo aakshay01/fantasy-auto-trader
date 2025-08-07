@@ -1,28 +1,36 @@
 name: FPL Transfer Bot
 
 on:
-  workflow_dispatch:      # manual button to test any time
+  workflow_dispatch:          # manual “Run workflow” button
   schedule:
     # 19:30 IST every Friday  →  14:00 UTC
-    - cron:  '30 14 * * 5'
+    - cron: '30 14 * * 5'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Pull your code
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2. Set up Python 3.11
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      # 3. Install deps (force a pre-built NumPy wheel first to avoid compilation)
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          # Grab wheel; no source build
+          pip install --upgrade --only-binary=:all: numpy==1.26.4
+          # Install remaining libs, preferring wheels
+          pip install --prefer-binary -r requirements.txt
 
-      - name: Run script
+      # 4. Run your script with the secrets
+      - name: Run transfer bot
         env:
           FPL_EMAIL:        ${{ secrets.FPL_EMAIL }}
           FPL_PASSWORD:     ${{ secrets.FPL_PASSWORD }}
