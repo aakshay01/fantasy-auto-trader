@@ -1,10 +1,13 @@
-# Minimal FPL helper: suggests 3 best single-transfer upgrades by xP (ep_next)
-# No login required; uses public endpoints. Sends results to Telegram.
+# Minimal FPL helper with login: gets your current picks via /my-team/,
+# computes top 3 single-transfer upgrades by ep_next (xP), and DMs you.
 
-import os, requests, math, pytz
+import os, math, pytz, requests, asyncio, aiohttp
 from datetime import datetime
 from telegram import Bot
+from fpl import FPL
 
+EMAIL = os.environ["FPL_EMAIL"]
+PASSWORD = os.environ["FPL_PASSWORD"]
 TEAM_ID = int(os.environ["FPL_TEAM_ID"])
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
@@ -25,11 +28,6 @@ def ep(v):
 def now():
     return datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d %b %H:%M")
 
-def build_maps(elements):
-    by_id = {p["id"]: p for p in elements}
-    by_teamcount = {}
-    return by_id, by_teamcount
-
 def team_counts(player_ids, by_id):
     counts = {}
     for pid in player_ids:
@@ -37,43 +35,43 @@ def team_counts(player_ids, by_id):
         counts[t] = counts.get(t, 0) + 1
     return counts
 
-def main():
-    # 1) Pull master data & find next event
+async def run():
+    # 1) Public master data
     boot = jget("/bootstrap-static/")
     elements = boot["elements"]
-    events = boot["events"]
     by_id = {p["id"]: p for p in elements}
 
-    next_event = next((e for e in events if e.get("is_next")), None)
-    if not next_event:
-        next_event = next((e for e in events if e.get("is_current")), events[0])
-    gw = next_event["id"]
+    # 2) Login + get your /my-team/ (picks + bank in tenths of £m)
+    async with aiohttp.ClientSession() as session:
+        fpl = FPL(session)
+        await fpl.login(EMAIL, PASSWORD)
+        my_team = await fpl.get_my_team(TEAM_ID)
 
-    # 2) Entry info (bank) + current picks (for next or current GW)
-    entry = jget(f"/entry/{TEAM_ID}/")
-    bank = int(entry.get("bank", 0))  # in tenths of £m
+    # my_team.picks may be objects; normalize to dicts with 'element'
+    picks = getattr(my_team, "picks", [])
+    if picks and hasattr(picks[0], "element"):
+        team_ids = [p.element for p in picks]
+    else:
+        team_ids = [p["element"] for p in picks]
 
-    def safe_picks(event_id):
-        try:
-            return jget(f"/entry/{TEAM_ID}/event/{event_id}/picks/")["picks"]
-        except Exception:
-            # fallback to current event if next not available yet
-            cur = next((e for e in events if e.get("is_current")), events[-1])
-            return jget(f"/entry/{TEAM_ID}/event/{cur['id']}/picks/")["picks"]
+    transfers = getattr(my_team, "transfers", {}) or {}
+    bank = getattr(transfers, "bank", None)
+    if bank is None and isinstance(transfers, dict):
+        bank = transfers.get("bank", 0)
+    bank = int(bank or 0)  # tenths of £m
 
-    picks = safe_picks(gw)
-    team_ids = [p["element"] for p in picks]
-    pos_of = {p["element"]: by_id[p["element"]]["element_type"] for p in picks}
-    cost_of = {p["element"]: by_id[p["element"]]["now_cost"] for p in picks}
-    club_of = {p["element"]: by_id[p["element"]]["team"] for p in picks}
+    # helpers
+    pos_of = {pid: by_id[pid]["element_type"] for pid in team_ids}
+    cost_of = {pid: by_id[pid]["now_cost"] for pid in team_ids}
+    club_of = {pid: by_id[pid]["team"] for pid in team_ids}
     team_club_counts = team_counts(team_ids, by_id)
 
-    # 3) Build candidate pool by position (only available players)
+    # 3) Candidate pool (only active/doubt players you don't own)
     pool_by_pos = {1: [], 2: [], 3: [], 4: []}
     for p in elements:
-        if p["id"] in team_ids:  # already own
+        if p["id"] in team_ids:
             continue
-        if p["status"] not in ("a", "d"):  # active or doubt only
+        if p["status"] not in ("a", "d"):
             continue
         pool_by_pos[p["element_type"]].append(p)
 
@@ -85,11 +83,9 @@ def main():
         sell_club = club_of[sell]
         sell_xp = ep(by_id[sell]["ep_next"])
 
-        # Adjust counts if we sell first
         counts = dict(team_club_counts)
         counts[sell_club] -= 1
-
-        budget = bank + sell_cost  # all in tenths of £m
+        budget = bank + sell_cost
 
         for cand in pool_by_pos[sell_pos]:
             buy_cost = cand["now_cost"]
@@ -98,24 +94,21 @@ def main():
             buy_club = cand["team"]
             if counts.get(buy_club, 0) + 1 > 3:
                 continue
-
             delta = ep(cand["ep_next"]) - sell_xp
             if delta <= 0:
                 continue
-
             suggestions.append({
                 "out_id": sell,
                 "in_id": cand["id"],
                 "delta": round(delta, 2),
-                "out_name": f'{by_id[sell]["web_name"]}',
-                "in_name": f'{cand["web_name"]}',
+                "out_name": by_id[sell]["web_name"],
+                "in_name": cand["web_name"],
                 "out_cost": sell_cost/10.0,
                 "in_cost": buy_cost/10.0,
             })
 
-    # Sort by delta desc, take top 3 unique by (out,in)
     suggestions.sort(key=lambda x: x["delta"], reverse=True)
-    seen, top3 = set(), []
+    top3, seen = [], set()
     for s in suggestions:
         key = (s["out_id"], s["in_id"])
         if key in seen:
@@ -125,19 +118,18 @@ def main():
         if len(top3) == 3:
             break
 
-    # 5) Send Telegram DM
     bot = Bot(TG_TOKEN)
     if not top3:
-        bot.send_message(CHAT_ID, f"({now()}) No positive xP single-transfer upgrades found this GW.")
+        bot.send_message(CHAT_ID, f"({now()}) No positive xP single-transfer upgrades found.")
         return
 
     lines = [f"({now()}) Top single-transfer upgrades by xP:"]
     for i, s in enumerate(top3, 1):
         lines.append(
-            f"{i}. {s['out_name']} → {s['in_name']}  "
+            f"{i}. {s['out_name']} → {s['in_name']} "
             f"(ΔxP +{s['delta']}, £{s['out_cost']:.1f}m → £{s['in_cost']:.1f}m)"
         )
     bot.send_message(CHAT_ID, "\n".join(lines))
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
