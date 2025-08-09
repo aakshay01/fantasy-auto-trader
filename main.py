@@ -1,82 +1,101 @@
-# Logs into FPL using the official 'fpl' client, pulls your /my-team/ picks,
-# computes top 3 single-transfer upgrades by ep_next (xP), and DMs you via Telegram API.
-
-import os, asyncio, aiohttp, pytz
+# Headless login with Playwright → call FPL API → suggest 3 best single-transfer upgrades → DM on Telegram
+import os, asyncio, pytz, requests
 from datetime import datetime
-from fpl import FPL
+from playwright.async_api import async_playwright
 
-EMAIL = os.environ["FPL_EMAIL"]
-PASSWORD = os.environ["FPL_PASSWORD"]
+EMAIL   = os.environ["FPL_EMAIL"]
+PASSWORD= os.environ["FPL_PASSWORD"]
 TEAM_ID = int(os.environ["FPL_TEAM_ID"])
-TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
+TG_TOKEN= os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+BASE = "https://fantasy.premierleague.com/api"
 
 def now_ist():
     return datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d %b %H:%M")
 
 def ep(v):
-    try:
-        return float(v) if v not in (None, "", "0.0") else 0.0
-    except Exception:
-        return 0.0
+    try: return float(v) if v not in (None, "", "0.0") else 0.0
+    except: return 0.0
 
 def team_counts(player_ids, by_id):
-    counts = {}
+    c={}
     for pid in player_ids:
-        t = by_id[pid]["team"]
-        counts[t] = counts.get(t, 0) + 1
-    return counts
+        t = by_id[pid]["team"]; c[t]=c.get(t,0)+1
+    return c
 
-async def send_telegram(session, text):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    async with session.post(url, json=payload) as r:
-        if r.status != 200:
-            body = await r.text()
-            print("Telegram send error:", r.status, body)
+def tg_send(text):
+    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": CHAT_ID, "text": text}, timeout=30)
+    if r.status_code != 200:
+        print("Telegram error:", r.status_code, r.text)
+
+async def login_and_context(p):
+    browser = await p.chromium.launch(headless=True)
+    ctx = await browser.new_context(user_agent=UA)
+    page = await ctx.new_page()
+
+    # Go straight to the accounts login page (SSO)
+    login_url = ("https://users.premierleague.com/accounts/login/"
+                 "?redirect_uri=https://fantasy.premierleague.com/&app=plfpl-web")
+    await page.goto(login_url, wait_until="domcontentloaded")
+
+    # Cookie banner (best-effort)
+    for sel in ['text="Accept all cookies"', 'text="Accept All"', 'button:has-text("Accept")']:
+        try: await page.locator(sel).click(timeout=1500); break
+        except: pass
+
+    # Fill and submit
+    await page.fill('input[name="login"]', EMAIL)
+    await page.fill('input[name="password"]', PASSWORD)
+    await page.click('button[type="submit"]')
+
+    # Wait for SSO to stick: poll /api/me
+    ok = False
+    for _ in range(20):
+        r = await ctx.request.get(f"{BASE}/me/")
+        if r.status == 200:
+            ok = True; break
+        await page.wait_for_timeout(500)
+    if not ok:
+        raise RuntimeError("Login failed: /api/me stayed non-200")
+
+    return browser, ctx
 
 async def main():
-    async with aiohttp.ClientSession(headers=UA) as session:
-        # 1) FPL login via official client
-        fpl = FPL(session)
-        await fpl.login(EMAIL, PASSWORD)
+    async with async_playwright() as p:
+        browser, ctx = await login_and_context(p)
 
-        # 2) Public bootstrap for player data
-        async with session.get("https://fantasy.premierleague.com/api/bootstrap-static/") as r:
-            r.raise_for_status()
-            boot = await r.json()
+        # Public players data
+        r = await ctx.request.get(f"{BASE}/bootstrap-static/")
+        r.raise_for_status()
+        boot = await r.json()
         elements = boot["elements"]
         by_id = {p["id"]: p for p in elements}
 
-        # 3) Your team picks + bank
-        my_team = await fpl.get_my_team(TEAM_ID)   # authenticated call
-        picks = getattr(my_team, "picks", [])
-        if picks and hasattr(picks[0], "element"):
-            team_ids = [p.element for p in picks]
-        else:
-            team_ids = [p["element"] for p in picks]
+        # Your team (auth required)
+        r = await ctx.request.get(f"{BASE}/my-team/{TEAM_ID}/")
+        r.raise_for_status()
+        my_team = await r.json()
 
-        transfers = getattr(my_team, "transfers", {}) or {}
-        bank = getattr(transfers, "bank", None)
-        if bank is None and isinstance(transfers, dict):
-            bank = transfers.get("bank", 0)
-        bank = int(bank or 0)  # tenths of £m
+        picks = my_team["picks"]
+        bank  = int(my_team.get("transfers", {}).get("bank", 0))  # tenths of £m
 
+        team_ids = [p["element"] for p in picks]
         pos_of   = {pid: by_id[pid]["element_type"] for pid in team_ids}
         cost_of  = {pid: by_id[pid]["now_cost"]      for pid in team_ids}
         club_of  = {pid: by_id[pid]["team"]          for pid in team_ids}
         club_cnt = team_counts(team_ids, by_id)
 
-        # 4) Candidate pool (only active/doubt, not already owned)
+        # candidate pool (active/doubt, not owned)
         pool_by_pos = {1: [], 2: [], 3: [], 4: []}
         for p in elements:
             if p["id"] in team_ids: continue
-            if p["status"] not in ("a", "d"): continue
+            if p["status"] not in ("a","d"): continue
             pool_by_pos[p["element_type"]].append(p)
 
-        # 5) Evaluate single-transfer upgrades under budget & 3-per-club
+        # evaluate single-transfer upgrades under budget & 3-per-club
         suggestions = []
         for sell in team_ids:
             sell_pos  = pos_of[sell]
@@ -84,8 +103,7 @@ async def main():
             sell_club = club_of[sell]
             sell_xp   = ep(by_id[sell]["ep_next"])
 
-            counts = dict(club_cnt)
-            counts[sell_club] -= 1
+            counts = dict(club_cnt); counts[sell_club] -= 1
             budget = bank + sell_cost
 
             for cand in pool_by_pos[sell_pos]:
@@ -96,32 +114,33 @@ async def main():
                 delta = ep(cand["ep_next"]) - sell_xp
                 if delta <= 0: continue
                 suggestions.append({
-                    "out_id": sell, "in_id": cand["id"],
                     "out_name": by_id[sell]["web_name"],
-                    "in_name": cand["web_name"],
-                    "delta": round(delta, 2),
-                    "out_cost": sell_cost/10.0, "in_cost": buy_cost/10.0
+                    "in_name":  cand["web_name"],
+                    "delta":    round(delta, 2),
+                    "out_cost": sell_cost/10.0,
+                    "in_cost":  buy_cost/10.0
                 })
 
         suggestions.sort(key=lambda x: x["delta"], reverse=True)
         top3, seen = [], set()
-        for sug in suggestions:
-            key = (sug["out_id"], sug["in_id"])
+        for s in suggestions:
+            key = (s["out_name"], s["in_name"])
             if key in seen: continue
-            seen.add(key); top3.append(sug)
+            seen.add(key); top3.append(s)
             if len(top3) == 3: break
 
         if not top3:
-            await send_telegram(session, f"({now_ist()}) No positive xP single-transfer upgrades found.")
-            return
+            tg_send(f"({now_ist()}) No positive xP single-transfer upgrades found.")
+        else:
+            lines = [f"({now_ist()}) Top single-transfer upgrades by xP:"]
+            for i, s in enumerate(top3, 1):
+                lines.append(
+                    f"{i}. {s['out_name']} → {s['in_name']} "
+                    f"(ΔxP +{s['delta']}, £{s['out_cost']:.1f}m → £{s['in_cost']:.1f}m)"
+                )
+            tg_send("\n".join(lines))
 
-        lines = [f"({now_ist()}) Top single-transfer upgrades by xP:"]
-        for i, sgg in enumerate(top3, 1):
-            lines.append(
-                f"{i}. {sgg['out_name']} → {sgg['in_name']} "
-                f"(ΔxP +{sgg['delta']}, £{sgg['out_cost']:.1f}m → £{sgg['in_cost']:.1f}m)"
-            )
-        await send_telegram(session, "\n".join(lines))
+        await browser.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
