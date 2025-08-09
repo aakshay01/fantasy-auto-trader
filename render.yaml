@@ -1,7 +1,0 @@
-services:
-  - type: cron
-    name: fpl-transfer-bot
-    # Fri 19:30 IST → 14:00 UTC.  Change the cron string if you prefer a different time.
-    schedule: "30 14 * * 5"
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
