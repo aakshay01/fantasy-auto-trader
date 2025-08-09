@@ -1,9 +1,9 @@
 name: FPL Transfer Bot
 
 on:
-  workflow_dispatch:              # manual test button
+  workflow_dispatch:
   schedule:
-    - cron: '30 14 * * 5'         # Fri 19:30 IST (14:30 UTC if DST differs)
+    - cron: '30 14 * * 5'   # Fri 19:30 IST
 
 jobs:
   run-bot:
@@ -24,6 +24,8 @@ jobs:
 
       - name: Run
         env:
+          FPL_EMAIL:        ${{ secrets.FPL_EMAIL }}
+          FPL_PASSWORD:     ${{ secrets.FPL_PASSWORD }}
           FPL_TEAM_ID:      ${{ secrets.FPL_TEAM_ID }}
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
