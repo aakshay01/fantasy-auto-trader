@@ -1,7 +1,8 @@
-# Login to FPL with CSRF, fetch /api/my-team/{TEAM_ID}, suggest 3 best single-transfer
-# upgrades by ep_next (xP), send to Telegram. No heavy deps.
+# Robust FPL login (CSRF + SSO), fetch /api/my-team/{TEAM_ID},
+# suggest 3 best single-transfer upgrades by ep_next, DM via Telegram.
+# Also prints small debug lines to Actions logs so we can diagnose 403s.
 
-import os, pytz, requests
+import os, requests, pytz
 from datetime import datetime
 from telegram import Bot
 
@@ -13,7 +14,7 @@ CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 
 BASE = "https://fantasy.premierleague.com/api"
 UA = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
@@ -37,32 +38,37 @@ def login_session(email, password):
     s = requests.Session()
     s.headers.update(UA)
 
-    # 1) warm up main site (sets cookies like csrftoken)
+    # 1) Warm up main site (sets base cookies)
     s.get("https://fantasy.premierleague.com/", timeout=30)
 
-    # 2) hit the users login page to get a CSRF token
-    login_page = s.get(
+    # 2) Open accounts login page to get CSRF cookie
+    params = {
+        "redirect_uri": "https://fantasy.premierleague.com/",
+        "app": "plfpl-web",
+    }
+    lp = s.get(
         "https://users.premierleague.com/accounts/login/",
-        params={"redirect_uri": "https://fantasy.premierleague.com/", "app": "plfpl-web"},
+        params=params,
         headers={**UA, "Referer": "https://fantasy.premierleague.com/"},
         timeout=30,
     )
-    csrf = login_page.cookies.get("csrftoken") or s.cookies.get("csrftoken")
+    csrf = lp.cookies.get("csrftoken") or s.cookies.get("csrftoken") or ""
 
     payload = {
         "login": email,
         "password": password,
+        "remember": "true",
         "redirect_uri": "https://fantasy.premierleague.com/",
         "app": "plfpl-web",
-        "remember": "true",
-        "csrfmiddlewaretoken": csrf or "",
+        "csrfmiddlewaretoken": csrf,
     }
     headers = {
         **UA,
         "Origin": "https://users.premierleague.com",
-        "Referer": login_page.url,
+        "Referer": lp.url,
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
+        "X-CSRFToken": csrf,  # some deployments require this header too
     }
 
     r = s.post(
@@ -72,18 +78,23 @@ def login_session(email, password):
         allow_redirects=True,
         timeout=30,
     )
-    # some responses return 200 with JSON; others 204 after setting cookies
-    if r.status_code not in (200, 204):
-        r.raise_for_status()
 
-    # sanity check: can we access /my-team/ now?
-    t = s.get(f"{BASE}/my-team/{TEAM_ID}/", timeout=30, headers=UA)
-    if t.status_code == 403:
+    # Debug: show key cookies after login
+    cookie_names = sorted([c.name for c in s.cookies])
+    print("DEBUG cookies after login:", cookie_names)
+    print("DEBUG login status:", r.status_code)
+
+    # 3) Hit a protected endpoint on fantasy domain to finalize SSO
+    me = s.get(f"{BASE}/me/", timeout=30, headers=UA)
+    print("DEBUG /api/me status:", me.status_code)
+
+    if me.status_code in (401, 403):
         raise RuntimeError(
-            "Forbidden on /my-team/. Check that FPL_TEAM_ID is YOUR own team id "
-            "and credentials are correct. (Settings → Secrets → Actions)."
+            "Login did not carry over to fantasy.premierleague.com (403 on /api/me). "
+            "Common causes: wrong email/password, account has extra verification, "
+            "or TEAM_ID isn’t your own entry."
         )
-    t.raise_for_status()
+    me.raise_for_status()
     return s
 
 def main():
@@ -93,7 +104,11 @@ def main():
     boot = s.get(f"{BASE}/bootstrap-static/", timeout=30, headers=UA).json()
     elements = boot["elements"]; by_id = {p["id"]: p for p in elements}
 
-    my_team = s.get(f"{BASE}/my-team/{TEAM_ID}/", timeout=30, headers=UA).json()
+    my_team_resp = s.get(f"{BASE}/my-team/{TEAM_ID}/", timeout=30, headers=UA)
+    print("DEBUG /api/my-team status:", my_team_resp.status_code)
+    my_team_resp.raise_for_status()
+    my_team = my_team_resp.json()
+
     picks = my_team["picks"]
     bank  = int(my_team.get("transfers", {}).get("bank", 0))  # tenths of £m
 
@@ -106,10 +121,11 @@ def main():
     # candidate pool
     pool_by_pos = {1: [], 2: [], 3: [], 4: []}
     for p in elements:
-        if p["id"] in team_ids:     continue
-        if p["status"] not in ("a","d"): continue
+        if p["id"] in team_ids: continue
+        if p["status"] not in ("a", "d"): continue
         pool_by_pos[p["element_type"]].append(p)
 
+    # evaluate upgrades
     suggestions = []
     for sell in team_ids:
         sell_pos  = pos_of[sell]; sell_cost = cost_of[sell]
@@ -135,11 +151,11 @@ def main():
             })
 
     suggestions.sort(key=lambda x: x["delta"], reverse=True)
-    seen = set(); top3 = []
-    for sgg in suggestions:
-        key = (sgg["out_id"], sgg["in_id"])
+    top3, seen = [], set()
+    for sug in suggestions:
+        key = (sug["out_id"], sug["in_id"])
         if key in seen: continue
-        seen.add(key); top3.append(sgg)
+        seen.add(key); top3.append(sug)
         if len(top3) == 3: break
 
     if not top3:
