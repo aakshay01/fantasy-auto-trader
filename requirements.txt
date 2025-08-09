@@ -1,3 +1,5 @@
 requests==2.32.3
 python-telegram-bot==20.6
 pytz==2024.1
+python-fpl==0.7.5
+aiohttp==3.9.5
