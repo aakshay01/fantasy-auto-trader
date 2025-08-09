@@ -1,7 +1,7 @@
 # Headless login with Playwright → call FPL API → suggest 3 best single-transfer upgrades → DM on Telegram
 import os, asyncio, pytz, requests
 from datetime import datetime
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 EMAIL   = os.environ["FPL_EMAIL"]
 PASSWORD= os.environ["FPL_PASSWORD"]
@@ -9,7 +9,7 @@ TEAM_ID = int(os.environ["FPL_TEAM_ID"])
 TG_TOKEN= os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+UA_STR = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 BASE = "https://fantasy.premierleague.com/api"
 
 def now_ist():
@@ -31,29 +31,117 @@ def tg_send(text):
     if r.status_code != 200:
         print("Telegram error:", r.status_code, r.text)
 
+async def _accept_cookies(page):
+    # best-effort cookie banners
+    for sel in [
+        'button:has-text("Accept all cookies")',
+        'button:has-text("Accept All")',
+        'button:has-text("Accept")',
+        'text="Accept all cookies"',
+    ]:
+        try:
+            await page.locator(sel).click(timeout=1500)
+            break
+        except: pass
+
+async def _find_and_fill(page, selectors, value, kind):
+    """Try to fill `value` into the first matching selector on page or any iframe."""
+    # main frame first
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=2500)
+            await loc.fill(value)
+            print(f"DEBUG filled {kind} via main selector: {sel}")
+            return True
+        except: pass
+    # iframes
+    for fr in page.frames:
+        if fr == page.main_frame:
+            continue
+        for sel in selectors:
+            try:
+                loc = fr.locator(sel).first
+                await loc.wait_for(state="visible", timeout=2500)
+                await loc.fill(value)
+                print(f"DEBUG filled {kind} via iframe {fr.url} selector: {sel}")
+                return True
+            except: pass
+    return False
+
+async def _click_submit(page):
+    buttons = [
+        'button[type="submit"]',
+        'button:has-text("Sign in")',
+        'button:has-text("Log in")',
+        'button:has-text("Sign In")',
+        'button:has-text("Continue")',
+    ]
+    # main frame
+    for sel in buttons:
+        try:
+            await page.locator(sel).first.click(timeout=2500)
+            print(f"DEBUG clicked submit on main via {sel}")
+            return True
+        except: pass
+    # iframes
+    for fr in page.frames:
+        if fr == page.main_frame:
+            continue
+        for sel in buttons:
+            try:
+                await fr.locator(sel).first.click(timeout=2500)
+                print(f"DEBUG clicked submit in iframe {fr.url} via {sel}")
+                return True
+            except: pass
+    return False
+
 async def login_and_context(p):
     browser = await p.chromium.launch(headless=True)
-    ctx = await browser.new_context(user_agent=UA)
+    ctx = await browser.new_context(user_agent=UA_STR)
     page = await ctx.new_page()
 
-    # Go straight to the accounts login page (SSO)
     login_url = ("https://users.premierleague.com/accounts/login/"
                  "?redirect_uri=https://fantasy.premierleague.com/&app=plfpl-web")
     await page.goto(login_url, wait_until="domcontentloaded")
+    await _accept_cookies(page)
+    await page.wait_for_load_state("networkidle")
 
-    # Cookie banner (best-effort)
-    for sel in ['text="Accept all cookies"', 'text="Accept All"', 'button:has-text("Accept")']:
-        try: await page.locator(sel).click(timeout=1500); break
-        except: pass
+    # Try to fill credentials (main + iframes, multiple selector variants)
+    user_selectors = [
+        'input[name="login"]',
+        'input[name="email"]',
+        'input[name="username"]',
+        '#login', '#email', '#username',
+        'input[type="email"]'
+    ]
+    pass_selectors = [
+        'input[name="password"]',
+        '#password',
+        'input[type="password"]'
+    ]
 
-    # Fill and submit
-    await page.fill('input[name="login"]', EMAIL)
-    await page.fill('input[name="password"]', PASSWORD)
-    await page.click('button[type="submit"]')
+    ok_user = await _find_and_fill(page, user_selectors, EMAIL, "username")
+    ok_pass = await _find_and_fill(page, pass_selectors, PASSWORD, "password")
 
-    # Wait for SSO to stick: poll /api/me
+    if not ok_user or not ok_pass:
+        # Some flows show a "Sign in" button first which then loads the form in an iframe.
+        print("DEBUG username/password fields not found immediately; trying to reveal form...")
+        await _click_submit(page)  # try to open the form
+        await page.wait_for_timeout(1500)
+        ok_user = ok_user or await _find_and_fill(page, user_selectors, EMAIL, "username")
+        ok_pass = ok_pass or await _find_and_fill(page, pass_selectors, PASSWORD, "password")
+
+    if not ok_user or not ok_pass:
+        print("DEBUG frames present:", [f.url for f in page.frames])
+        raise PWTimeout("Could not find login inputs on page or iframes")
+
+    # Submit
+    await _click_submit(page)
+
+    # Poll /api/me until 200 or timeout
     ok = False
-    for _ in range(20):
+    for _ in range(24):
         r = await ctx.request.get(f"{BASE}/me/")
         if r.status == 200:
             ok = True; break
@@ -67,14 +155,14 @@ async def main():
     async with async_playwright() as p:
         browser, ctx = await login_and_context(p)
 
-        # Public players data
+        # Public players
         r = await ctx.request.get(f"{BASE}/bootstrap-static/")
         r.raise_for_status()
         boot = await r.json()
         elements = boot["elements"]
         by_id = {p["id"]: p for p in elements}
 
-        # Your team (auth required)
+        # Your team (auth)
         r = await ctx.request.get(f"{BASE}/my-team/{TEAM_ID}/")
         r.raise_for_status()
         my_team = await r.json()
