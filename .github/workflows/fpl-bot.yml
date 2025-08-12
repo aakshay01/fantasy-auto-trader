@@ -1,4 +1,4 @@
-name: FPL Transfer Bot
+name: FPL Transfer Bot (self-hosted)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted     # or: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
 
@@ -15,10 +15,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps (Playwright + browser)
+      - name: Install deps (first run downloads Chromium)
         run: |
+          pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          python -m playwright install chromium
 
       - name: Run
         env:
