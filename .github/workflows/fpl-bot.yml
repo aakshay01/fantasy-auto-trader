@@ -7,9 +7,16 @@ on:
 
 jobs:
   run-bot:
-    runs-on: self-hosted     # or: [self-hosted, macOS]
+    runs-on: self-hosted   # or: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4
+
+      # 👇 Fix for self-hosted macOS perms: set tool & temp caches to writable dirs
+      - name: Prepare runner caches
+        run: |
+          mkdir -p "${HOME}/.cache/runner/_tool" "${HOME}/.cache/runner/_temp"
+          echo "RUNNER_TOOL_CACHE=${HOME}/.cache/runner/_tool" >> "$GITHUB_ENV"
+          echo "RUNNER_TEMP=${HOME}/.cache/runner/_temp"       >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -17,11 +24,11 @@ jobs:
 
       - name: Install deps (first run downloads Chromium)
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Run
+      - name: Run bot
         env:
           FPL_EMAIL:        ${{ secrets.FPL_EMAIL }}
           FPL_PASSWORD:     ${{ secrets.FPL_PASSWORD }}
