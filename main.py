@@ -1,25 +1,34 @@
-# Headless login with Playwright → call FPL API → suggest 3 best single-transfer upgrades → DM on Telegram
-import os, asyncio, pytz, requests
+# Self-hosted runner version
+# Playwright logs in via the real browser flow, calls FPL API, and DM’s you the top 3
+# single-transfer upgrades (by ep_next) on Telegram.
+
+import os
+import asyncio
 from datetime import datetime
+
+import pytz
+import requests
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ----- env -----
+# ====== ENV (set as repo secrets) ======
 EMAIL    = os.environ["FPL_EMAIL"]
 PASSWORD = os.environ["FPL_PASSWORD"]
 TEAM_ID  = int(os.environ["FPL_TEAM_ID"])
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
-# ----- consts -----
+# ====== CONSTS ======
 UA_STR = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 BASE = "https://fantasy.premierleague.com/api"
 
-# ----- utils -----
-def now_ist():
+
+# ====== HELPERS ======
+def now_ist() -> str:
     return datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%d %b %H:%M")
+
 
 def ep(v):
     try:
@@ -27,12 +36,14 @@ def ep(v):
     except Exception:
         return 0.0
 
+
 def team_counts(player_ids, by_id):
-    c = {}
+    counts = {}
     for pid in player_ids:
         t = by_id[pid]["team"]
-        c[t] = c.get(t, 0) + 1
-    return c
+        counts[t] = counts.get(t, 0) + 1
+    return counts
+
 
 def tg_send(text: str):
     r = requests.post(
@@ -43,8 +54,9 @@ def tg_send(text: str):
     if r.status_code != 200:
         print("Telegram error:", r.status_code, r.text)
 
+
 async def _accept_cookies(page):
-    # best-effort cookie banners
+    # Best-effort cookie banners (label text varies)
     for sel in [
         'button:has-text("Accept all cookies")',
         'button:has-text("Accept All")',
@@ -58,8 +70,9 @@ async def _accept_cookies(page):
         except Exception:
             pass
 
-async def _find_and_fill(page, selectors, value, kind):
-    """Try to fill value into selector on main page or any iframe."""
+
+async def _find_and_fill(page, selectors, value, kind: str) -> bool:
+    """Fill a field either on the main page or any iframe."""
     # main frame
     for sel in selectors:
         try:
@@ -70,6 +83,7 @@ async def _find_and_fill(page, selectors, value, kind):
             return True
         except Exception:
             pass
+
     # iframes
     for fr in page.frames:
         if fr == page.main_frame:
@@ -85,14 +99,18 @@ async def _find_and_fill(page, selectors, value, kind):
                 pass
     return False
 
-async def _click_submit(page):
+
+async def _click_submit(page) -> bool:
     buttons = [
         'button[type="submit"]',
         'button:has-text("Sign in")',
         'button:has-text("Log in")',
         'button:has-text("Sign In")',
         'button:has-text("Continue")',
+        'text="Sign in"',
+        'text="Log in"',
     ]
+
     # main frame
     for sel in buttons:
         try:
@@ -101,6 +119,7 @@ async def _click_submit(page):
             return True
         except Exception:
             pass
+
     # iframes
     for fr in page.frames:
         if fr == page.main_frame:
@@ -114,8 +133,9 @@ async def _click_submit(page):
                 pass
     return False
 
+
 async def login_and_context(pw):
-    # create browser/context
+    # headless=True is fine on a self-hosted machine; change to False if you want to watch it
     browser = await pw.chromium.launch(headless=True)
     ctx = await browser.new_context(user_agent=UA_STR)
     page = await ctx.new_page()
@@ -127,11 +147,11 @@ async def login_and_context(pw):
     await page.goto(login_url, wait_until="domcontentloaded")
     await _accept_cookies(page)
 
-    # Some trackers keep network busy forever → don't block on 'networkidle'
+    # Don't block on 'networkidle' – some trackers keep it busy forever
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except PWTimeout:
-        pass  # harmless
+        pass
 
     # Try multiple selectors (main + iframes)
     user_selectors = [
@@ -142,18 +162,19 @@ async def login_and_context(pw):
         '#email',
         '#username',
         'input[type="email"]',
+        'input[autocomplete="username"]',
     ]
     pass_selectors = [
         'input[name="password"]',
         '#password',
         'input[type="password"]',
+        'input[autocomplete="current-password"]',
     ]
 
     filled_user = await _find_and_fill(page, user_selectors, EMAIL, "username")
     filled_pass = await _find_and_fill(page, pass_selectors, PASSWORD, "password")
 
     if not (filled_user and filled_pass):
-        # some flows gate the form behind a button; try to reveal it
         print("DEBUG: inputs not visible initially — trying to reveal form…")
         await _click_submit(page)
         await page.wait_for_timeout(1500)
@@ -164,9 +185,22 @@ async def login_and_context(pw):
         print("DEBUG: frames present:", [f.url for f in page.frames])
         raise PWTimeout("Could not find login inputs on page or in iframes")
 
+    # Submit (button click + Enter on password, for safety)
     await _click_submit(page)
+    try:
+        await page.keyboard.press("Enter")
+    except Exception:
+        pass
 
-    # Poll auth probe until 200 or timeout
+    # Some orgs show a brief "holding.html" page. If so, wait & continue.
+    for _ in range(6):
+        if any("holding.html" in f.url for f in page.frames):
+            print("DEBUG: holding page detected; waiting a bit…")
+            await page.wait_for_timeout(1000)
+        else:
+            break
+
+    # Poll /api/me until authenticated
     ok = False
     for _ in range(24):  # ~12s
         r = await ctx.request.get(f"{BASE}/me/")
@@ -180,12 +214,13 @@ async def login_and_context(pw):
 
     return browser, ctx
 
-# ----- main flow -----
+
+# ====== MAIN ======
 async def main():
     async with async_playwright() as pw:
         browser, ctx = await login_and_context(pw)
 
-        # Public players
+        # Public player data
         r = await ctx.request.get(f"{BASE}/bootstrap-static/")
         r.raise_for_status()
         boot = await r.json()
@@ -206,7 +241,7 @@ async def main():
         club_of = {pid: by_id[pid]["team"] for pid in team_ids}
         club_cnt = team_counts(team_ids, by_id)
 
-        # candidate pool (active/doubt, not owned)
+        # Candidate pool (only active/doubt, not owned)
         pool_by_pos = {1: [], 2: [], 3: [], 4: []}
         for p in elements:
             if p["id"] in team_ids:
@@ -215,7 +250,7 @@ async def main():
                 continue
             pool_by_pos[p["element_type"]].append(p)
 
-        # evaluate single-transfer upgrades under budget & 3-per-club
+        # Evaluate single-transfer upgrades under budget & 3-per-club
         suggestions = []
         for sell in team_ids:
             sell_pos = pos_of[sell]
@@ -270,6 +305,7 @@ async def main():
             tg_send("\n".join(lines))
 
         await browser.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
