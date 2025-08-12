@@ -3,36 +3,26 @@ name: FPL Transfer Bot (self-hosted)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 14 * * 5'   # Fri 19:30 IST
+    - cron: '30 14 * * 5'
 
 jobs:
   run-bot:
-    runs-on: self-hosted   # or: [self-hosted, macOS]
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
-      # 👇 Fix for self-hosted macOS perms: set tool & temp caches to writable dirs
-      - name: Prepare runner caches
-        run: |
-          mkdir -p "${HOME}/.cache/runner/_tool" "${HOME}/.cache/runner/_temp"
-          echo "RUNNER_TOOL_CACHE=${HOME}/.cache/runner/_tool" >> "$GITHUB_ENV"
-          echo "RUNNER_TEMP=${HOME}/.cache/runner/_temp"       >> "$GITHUB_ENV"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install deps (first run downloads Chromium)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install chromium
-
-      - name: Run bot
+      - name: Use system Python (venv) & run
         env:
           FPL_EMAIL:        ${{ secrets.FPL_EMAIL }}
           FPL_PASSWORD:     ${{ secrets.FPL_PASSWORD }}
           FPL_TEAM_ID:      ${{ secrets.FPL_TEAM_ID }}
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+        run: |
+          python3 -V
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install chromium
+          python main.py
