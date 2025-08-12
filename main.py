@@ -1,5 +1,5 @@
 # Self-hosted runner + persistent Chrome profile.
-# First run shows a real Chrome window; you log in once. Cookies persist at ~/.fpl-profile.
+# First run may show a real Chrome window; you log in once. Cookies persist at ~/.fpl-profile.
 # Then the script fetches your team and sends top 3 single-transfer upgrades (by ep_next) to Telegram.
 
 import os
@@ -12,11 +12,14 @@ import requests
 from playwright.async_api import async_playwright
 
 # ====== ENV (set as repo secrets) ======
-EMAIL    = os.environ["FPL_EMAIL"]          # only used for your own reference in the login
-PASSWORD = os.environ["FPL_PASSWORD"]       # (you'll type it in the Chrome window on first run)
+EMAIL    = os.environ["FPL_EMAIL"]          # only for your reference
+PASSWORD = os.environ["FPL_PASSWORD"]       # you'll type it in Chrome on first run if needed
 TEAM_ID  = int(os.environ["FPL_TEAM_ID"])
 TG_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+
+# Optional: set to "true" to run headless after you’ve logged in once
+HEADLESS = os.environ.get("FPL_HEADLESS", "").lower() in ("1", "true", "yes")
 
 # ====== CONSTS ======
 BASE = "https://fantasy.premierleague.com/api"
@@ -49,24 +52,31 @@ def tg_send(text: str):
     if r.status_code != 200:
         print("Telegram error:", r.status_code, r.text)
 
+async def api_get_json(ctx, path: str):
+    """Playwright request.get wrapper with proper status handling."""
+    r = await ctx.request.get(f"{BASE}{path}")
+    if r.status != 200:
+        body = await r.text()
+        raise RuntimeError(f"GET {path} -> {r.status}: {body}")
+    return await r.json()
+
 async def ensure_logged_in(ctx):
     """Return when /api/me returns 200. If not, open login and wait for you to sign in."""
-    # Quick probe with current cookies
     r = await ctx.request.get(f"{BASE}/me/")
     if r.status == 200:
         print("DEBUG: Already authenticated.")
         return
 
-    # Not authenticated: open FPL site in a visible Chrome window and let you log in.
+    # Not authenticated: open FPL site and let you log in.
     page = await ctx.new_page()
     print("\n=== ACTION NEEDED (first run only) ===")
     print("A Chrome window will open. Click 'Sign in' and log in to FPL.")
     print("If you see a 'holding' page or any challenge, complete it.")
-    print("I'll detect login automatically and continue.\n")
+    print("I’ll detect login automatically and continue.\n")
 
     await page.goto("https://fantasy.premierleague.com/", wait_until="domcontentloaded")
 
-    # Give you up to 5 minutes to complete login. Poll /api/me every 2 seconds.
+    # Give up to 5 minutes to complete login. Poll /api/me every 2 seconds.
     for _ in range(150):  # 150 * 2s = 300s
         r = await ctx.request.get(f"{BASE}/me/")
         if r.status == 200:
@@ -82,41 +92,34 @@ async def run_bot():
     async with async_playwright() as pw:
         PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Use your installed Chrome with a persistent profile (so cookies survive).
+        # Persistent profile so cookies/token survive between runs
         ctx = await pw.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
-            channel="chrome",              # use system Chrome (more 'human')
-            headless=False,                # show window; helps pass anti-bot on first login
+            channel="chrome",              # system Chrome looks most human
+            headless=HEADLESS,             # first run: keep visible; later you can set FPL_HEADLESS=true
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
+        # Mild stealth tweaks
         await ctx.add_init_script("""Object.defineProperty(navigator,'webdriver',{get:()=>undefined});""")
         await ctx.add_init_script("""window.chrome = { runtime: {} };""")
         await ctx.add_init_script("""Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});""")
         await ctx.add_init_script("""Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});""")
 
-        # Set UA on the request context too
         await ctx.set_extra_http_headers({"User-Agent": UA, "Referer": "https://fantasy.premierleague.com/"})
 
         # Ensure we are logged in (manual once)
         await ensure_logged_in(ctx)
 
-        # Public players
-        r = await ctx.request.get(f"{BASE}/bootstrap-static/")
-        r.raise_for_status()
-        boot = await r.json()
+        # ----- Public players -----
+        boot = await api_get_json(ctx, "/bootstrap-static/")
         elements = boot["elements"]
         by_id = {p["id"]: p for p in elements}
 
-        # Your team (needs auth)
-        r = await ctx.request.get(f"{BASE}/my-team/{TEAM_ID}/")
-        if r.status != 200:
-            txt = await r.text()
-            raise RuntimeError(f"/my-team returned {r.status}: {txt}")
-        my_team = await r.json()
-
+        # ----- Your team (auth) -----
+        my_team = await api_get_json(ctx, f"/my-team/{TEAM_ID}/")
         picks = my_team["picks"]
         bank  = int(my_team.get("transfers", {}).get("bank", 0))  # tenths of £m
 
